@@ -1,0 +1,2 @@
+- [User Profile](user_profile.md) — Backend dev learner, Go, knows some OOP and Go/frontend endpoints
+- [Learning Project](project_backend_learning.md) — Building full-stack learning app to master backend development
