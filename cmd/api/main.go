@@ -12,6 +12,7 @@ import (
 	"github.com/guilletrejo/sachaweb/internal/config"
 	"github.com/guilletrejo/sachaweb/internal/handler"
 	"github.com/guilletrejo/sachaweb/internal/repository"
+	"github.com/guilletrejo/sachaweb/internal/server/middleware"
 	"github.com/guilletrejo/sachaweb/internal/service"
 	"github.com/guilletrejo/sachaweb/migrations"
 )
@@ -52,36 +53,60 @@ func main() {
 	}
 
 	// Step 4: Create the REPOSITORY layer.
-	//
-	// LOOK AT THIS LINE COMPARED TO PHASE 2:
-	//   Phase 2: productRepo := repository.NewMemoryProductRepo(sampleProducts)
-	//   Phase 3: productRepo := repository.NewPostgresProductRepo(pool)
-	//
-	// ONE LINE CHANGED. The rest of the application (service, handler,
-	// routes) is completely untouched. This is the repository pattern
-	// and dependency injection paying off — swap the storage engine
-	// by changing how you construct the repository. Nothing else knows.
 	productRepo := repository.NewPostgresProductRepo(pool)
+	userRepo := repository.NewPostgresUserRepo(pool)
 
-	// Step 5-7: Create service → handler → routes (unchanged from Phase 2).
+	// Step 5: Create the SERVICE layer.
 	productService := service.NewProductService(productRepo)
-	productHandler := handler.NewProductHandler(productService)
+	userService := service.NewUserService(userRepo, cfg.JWTSecret)
 
+	// Step 6: Create the HANDLER layer.
+	productHandler := handler.NewProductHandler(productService)
+	userHandler := handler.NewUserHandler(userService)
+
+	// Step 7: Create the auth middleware.
+	//
+	// THE MIDDLEWARE PATTERN: func(http.Handler) http.Handler
+	// auth is a function that takes a handler and returns a new handler
+	// that checks the JWT token first. If the token is valid, it calls
+	// the original handler. If not, it returns 401 and stops.
+	//
+	// Usage: mux.Handle("POST /products", auth(productHandler.HandleCreate()))
+	// This means: "when POST /products arrives, first run auth, then HandleCreate"
+	auth := middleware.Auth(userService)
+
+	// Step 8: Register routes.
 	mux := http.NewServeMux()
+
+	// PUBLIC routes — anyone can access these.
 	mux.HandleFunc("GET /health", handler.HandleHealth())
 	mux.HandleFunc("GET /products", productHandler.HandleList())
 	mux.HandleFunc("GET /products/{id}", productHandler.HandleGet())
-	mux.HandleFunc("POST /products", productHandler.HandleCreate())
-	mux.HandleFunc("PUT /products/{id}", productHandler.HandleUpdate())
-	mux.HandleFunc("DELETE /products/{id}", productHandler.HandleDelete())
+	mux.HandleFunc("POST /register", userHandler.HandleRegister())
+	mux.HandleFunc("POST /login", userHandler.HandleLogin())
 
-	// Step 8: Start server.
+	// PROTECTED routes — require a valid JWT token.
+	// Notice: Handle (not HandleFunc) because auth() returns http.Handler.
+	// The auth middleware wraps the handler: auth checks token → handler runs.
+	//
+	// WHO CAN DO WHAT:
+	//   Anyone can browse products (GET)
+	//   Only logged-in users can create/update/delete products
+	//   This is how real e-commerce works — customers browse, sellers manage
+	mux.Handle("POST /products", auth(productHandler.HandleCreate()))
+	mux.Handle("PUT /products/{id}", auth(productHandler.HandleUpdate()))
+	mux.Handle("DELETE /products/{id}", auth(productHandler.HandleDelete()))
+
+	// Step 9: Start server.
 	addr := fmt.Sprintf(":%s", cfg.Port)
 	log.Printf("Starting server on %s (PostgreSQL connected)", addr)
-	log.Printf("Endpoints:")
+	log.Printf("Public endpoints:")
 	log.Printf("  GET    /health")
 	log.Printf("  GET    /products")
 	log.Printf("  GET    /products/{id}")
+	log.Printf("  POST   /register")
+	log.Printf("  POST   /login")
+	log.Printf("Protected endpoints (require JWT):")
 	log.Printf("  POST   /products")
 	log.Printf("  PUT    /products/{id}")
 	log.Printf("  DELETE /products/{id}")
@@ -131,23 +156,28 @@ func connectDB(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 
 // runMigrations reads embedded SQL files and executes them against the database.
 //
-// This is a simple migration runner: it reads the .up.sql files and runs them.
-// The SQL uses IF NOT EXISTS, so running it multiple times is safe (idempotent).
+// This is a simple migration runner: it reads each .up.sql file in order
+// and executes it. The SQL uses IF NOT EXISTS / IF NOT EXISTS, so running
+// it multiple times is safe (idempotent).
 //
 // In larger projects, you'd use a migration library like golang-migrate that
-// tracks which migrations have been applied. For our single migration, this
+// tracks which migrations have been applied. For our few migrations, this
 // simple approach works perfectly.
 func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	// Read the embedded SQL file from the migrations package.
-	sql, err := migrations.FS.ReadFile("000001_create_products_table.up.sql")
-	if err != nil {
-		return fmt.Errorf("reading migration file: %w", err)
+	// List of migration files in order. Each new phase adds to this list.
+	migrationFiles := []string{
+		"000001_create_products_table.up.sql",
+		"000002_create_users_table.up.sql",
 	}
 
-	// Execute the SQL against the database.
-	_, err = pool.Exec(ctx, string(sql))
-	if err != nil {
-		return fmt.Errorf("executing migration: %w", err)
+	for _, file := range migrationFiles {
+		sql, err := migrations.FS.ReadFile(file)
+		if err != nil {
+			return fmt.Errorf("reading migration %s: %w", file, err)
+		}
+		if _, err := pool.Exec(ctx, string(sql)); err != nil {
+			return fmt.Errorf("executing migration %s: %w", file, err)
+		}
 	}
 
 	log.Println("Database migrations applied successfully")

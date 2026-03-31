@@ -11,6 +11,7 @@ import "os"
 type Config struct {
 	Port        string // The port the HTTP server listens on (e.g., "8080")
 	DatabaseURL string // PostgreSQL connection string
+	JWTSecret   string // Secret key for signing JWT tokens
 }
 
 // Load reads configuration from environment variables.
@@ -27,7 +28,11 @@ type Config struct {
 //   ?sslmode=disable      → connection options (no SSL for local dev)
 //
 // In production, this would be something like:
-//   postgres://app_user:s3cur3p@ss@db.neon.tech:5432/sachaweb_prod?sslmode=require
+//   postgres://app_user:s3cur3p4ss@db.neon.tech:5432/sachaweb_prod?sslmode=require
+//
+// If the password contains special characters like @ : / #, they must be
+// percent-encoded (e.g., p@ss → p%40ss). Cloud providers give you the
+// pre-encoded URL, so you rarely do this manually.
 //
 // The DATABASE_URL environment variable is a standard convention used by
 // Heroku, Fly.io, Render, Railway, and most cloud platforms.
@@ -35,6 +40,10 @@ func Load() Config {
 	return Config{
 		Port:        getEnv("PORT", "8080"),
 		DatabaseURL: getEnv("DATABASE_URL", "postgres://sachaweb:sachaweb@localhost:5432/sachaweb?sslmode=disable"),
+		// JWT_SECRET should be a long, random string in production.
+		// The default is fine for local development ONLY.
+		// In production: JWT_SECRET=$(openssl rand -hex 32)
+		JWTSecret: getEnv("JWT_SECRET", "sachaweb-dev-secret-change-in-production"),
 	}
 }
 

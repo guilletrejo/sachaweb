@@ -50,3 +50,18 @@ type ConflictError struct {
 func (e *ConflictError) Error() string {
 	return fmt.Sprintf("%s with id '%s' already exists", e.Resource, e.ID)
 }
+
+// AuthError is returned when authentication fails.
+// Examples: invalid credentials, expired token, missing token.
+//
+// WHY A GENERIC ERROR (not "wrong password" / "user not found")?
+// Specific auth errors help attackers. "User not found" reveals which
+// emails are registered. "Wrong password" confirms the email exists.
+// A generic "invalid credentials" gives nothing away.
+type AuthError struct {
+	Message string
+}
+
+func (e *AuthError) Error() string {
+	return e.Message
+}

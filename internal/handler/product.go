@@ -138,6 +138,8 @@ func handleServiceError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", e.Error())
 	case *model.ConflictError:
 		writeError(w, http.StatusConflict, "CONFLICT", e.Error())
+	case *model.AuthError:
+		writeError(w, http.StatusUnauthorized, "AUTH_ERROR", e.Error())
 	default:
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An unexpected error occurred")
 	}
