@@ -1,63 +1,83 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/guilletrejo/sachaweb/internal/config"
 	"github.com/guilletrejo/sachaweb/internal/handler"
-	"github.com/guilletrejo/sachaweb/internal/model"
 	"github.com/guilletrejo/sachaweb/internal/repository"
 	"github.com/guilletrejo/sachaweb/internal/service"
+	"github.com/guilletrejo/sachaweb/migrations"
 )
 
 func main() {
-	// Step 1: Load configuration.
+	// Step 1: Load configuration from environment variables.
 	cfg := config.Load()
 
-	// Step 2: Create the REPOSITORY layer (data storage).
+	// Step 2: Connect to PostgreSQL.
 	//
-	// We seed it with sample products so there's data to work with.
-	// In Phase 3, this becomes a PostgreSQL connection instead.
-	sampleProducts := []model.Product{
-		{ID: "1", Name: "Mechanical Keyboard", Description: "RGB mechanical keyboard with Cherry MX switches", Price: 8999, Category: "electronics"},
-		{ID: "2", Name: "Go Programming Book", Description: "The Go Programming Language by Donovan & Kernighan", Price: 3495, Category: "books"},
-		{ID: "3", Name: "USB-C Hub", Description: "7-in-1 USB-C hub with HDMI, USB 3.0, and SD card reader", Price: 4599, Category: "electronics"},
+	// WHAT IS context.Background()?
+	// It's the "root" context — it never expires and is never cancelled.
+	// Use it for startup/shutdown operations that shouldn't be tied to
+	// any specific HTTP request. Once the server is running, each request
+	// gets its own context via r.Context().
+	//
+	// WHY A 10-SECOND TIMEOUT?
+	// If PostgreSQL is down or unreachable, we don't want to hang forever.
+	// context.WithTimeout creates a context that automatically cancels
+	// after the given duration. If the connection isn't established in
+	// 10 seconds, it fails fast instead of waiting indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, err := connectDB(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
 	}
-	productRepo := repository.NewMemoryProductRepo(sampleProducts)
+	// defer pool.Close() ensures the connection pool is cleaned up
+	// when main() exits. This releases all database connections.
+	defer pool.Close()
 
-	// Step 3: Create the SERVICE layer (business logic).
+	// Step 3: Run database migrations.
+	// This creates the products table if it doesn't exist.
+	// On subsequent startups, it's a no-op (IF NOT EXISTS).
+	if err := runMigrations(ctx, pool); err != nil {
+		log.Fatalf("Failed to run migrations: %v", err)
+	}
+
+	// Step 4: Create the REPOSITORY layer.
 	//
-	// The service receives the repository through its constructor.
-	// This is dependency injection — no global variables, no magic.
-	// The wiring happens here in main.go, and ONLY here.
+	// LOOK AT THIS LINE COMPARED TO PHASE 2:
+	//   Phase 2: productRepo := repository.NewMemoryProductRepo(sampleProducts)
+	//   Phase 3: productRepo := repository.NewPostgresProductRepo(pool)
+	//
+	// ONE LINE CHANGED. The rest of the application (service, handler,
+	// routes) is completely untouched. This is the repository pattern
+	// and dependency injection paying off — swap the storage engine
+	// by changing how you construct the repository. Nothing else knows.
+	productRepo := repository.NewPostgresProductRepo(pool)
+
+	// Step 5-7: Create service → handler → routes (unchanged from Phase 2).
 	productService := service.NewProductService(productRepo)
-
-	// Step 4: Create the HANDLER layer (HTTP interface).
-	//
-	// The handler receives the service through its constructor.
-	// Notice the chain: handler → service → repository.
-	// Each layer only knows about the one directly below it.
 	productHandler := handler.NewProductHandler(productService)
 
-	// Step 5: Create router and register routes.
 	mux := http.NewServeMux()
-
-	// Health check (unchanged from Phase 1).
 	mux.HandleFunc("GET /health", handler.HandleHealth())
+	mux.HandleFunc("GET /products", productHandler.HandleList())
+	mux.HandleFunc("GET /products/{id}", productHandler.HandleGet())
+	mux.HandleFunc("POST /products", productHandler.HandleCreate())
+	mux.HandleFunc("PUT /products/{id}", productHandler.HandleUpdate())
+	mux.HandleFunc("DELETE /products/{id}", productHandler.HandleDelete())
 
-	// Product CRUD routes.
-	// Each HTTP method + path maps to a specific operation:
-	mux.HandleFunc("GET /products", productHandler.HandleList())       // List all
-	mux.HandleFunc("GET /products/{id}", productHandler.HandleGet())   // Get one
-	mux.HandleFunc("POST /products", productHandler.HandleCreate())    // Create
-	mux.HandleFunc("PUT /products/{id}", productHandler.HandleUpdate()) // Update
-	mux.HandleFunc("DELETE /products/{id}", productHandler.HandleDelete()) // Delete
-
-	// Step 6: Start server.
+	// Step 8: Start server.
 	addr := fmt.Sprintf(":%s", cfg.Port)
-	log.Printf("Starting server on %s", addr)
+	log.Printf("Starting server on %s (PostgreSQL connected)", addr)
 	log.Printf("Endpoints:")
 	log.Printf("  GET    /health")
 	log.Printf("  GET    /products")
@@ -69,4 +89,67 @@ func main() {
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// connectDB creates a connection pool to PostgreSQL.
+//
+// WHAT IS pgxpool.ParseConfig?
+// It parses the DATABASE_URL into a configuration struct, which you can
+// then customize before creating the pool. This is where you'd set:
+// - MaxConns: maximum number of connections (default: 4 per CPU core)
+// - MinConns: minimum idle connections to keep warm
+// - MaxConnLifetime: how long a connection lives before being recycled
+//
+// For now, we just set MaxConns to 10 (plenty for local development).
+// In production, you'd tune this based on your traffic and DB capacity.
+func connectDB(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
+	poolConfig, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("parsing database URL: %w", err)
+	}
+
+	// MaxConns limits how many simultaneous database connections the pool
+	// maintains. Each connection uses memory on both the app and DB side.
+	// 10 is fine for local dev. Production might use 20-50 depending on
+	// the database server's capacity.
+	poolConfig.MaxConns = 10
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		return nil, fmt.Errorf("creating connection pool: %w", err)
+	}
+
+	// Ping verifies the connection actually works (not just that parsing succeeded).
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("pinging database: %w", err)
+	}
+
+	log.Printf("Connected to PostgreSQL (max connections: %d)", poolConfig.MaxConns)
+	return pool, nil
+}
+
+// runMigrations reads embedded SQL files and executes them against the database.
+//
+// This is a simple migration runner: it reads the .up.sql files and runs them.
+// The SQL uses IF NOT EXISTS, so running it multiple times is safe (idempotent).
+//
+// In larger projects, you'd use a migration library like golang-migrate that
+// tracks which migrations have been applied. For our single migration, this
+// simple approach works perfectly.
+func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
+	// Read the embedded SQL file from the migrations package.
+	sql, err := migrations.FS.ReadFile("000001_create_products_table.up.sql")
+	if err != nil {
+		return fmt.Errorf("reading migration file: %w", err)
+	}
+
+	// Execute the SQL against the database.
+	_, err = pool.Exec(ctx, string(sql))
+	if err != nil {
+		return fmt.Errorf("executing migration: %w", err)
+	}
+
+	log.Println("Database migrations applied successfully")
+	return nil
 }

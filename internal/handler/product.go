@@ -9,16 +9,12 @@ import (
 )
 
 // ErrorResponse is the standard JSON error format for ALL error responses.
-// Having a consistent error format is critical for API consumers —
-// they can always expect {"error": "...", "code": "..."} on errors.
 type ErrorResponse struct {
-	Error string `json:"error"` // Human-readable error message
-	Code  string `json:"code"`  // Machine-readable error code (e.g., "NOT_FOUND")
+	Error string `json:"error"`
+	Code  string `json:"code"`
 }
 
 // ProductHandler holds all HTTP handlers related to products.
-// It depends on ProductService, not the repository directly.
-// Handlers talk to services, services talk to repositories.
 type ProductHandler struct {
 	service *service.ProductService
 }
@@ -29,9 +25,15 @@ func NewProductHandler(svc *service.ProductService) *ProductHandler {
 }
 
 // HandleList handles GET /products — returns all products.
+//
+// WHAT CHANGED IN PHASE 3?
+// We now pass r.Context() to the service. r.Context() returns the
+// context associated with this HTTP request. If the client disconnects,
+// this context gets cancelled, which propagates all the way down to
+// the database query through: handler → service → repository → pgx → PostgreSQL.
 func (h *ProductHandler) HandleList() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		products, err := h.service.ListProducts()
+		products, err := h.service.ListProducts(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
 			return
@@ -42,18 +44,11 @@ func (h *ProductHandler) HandleList() http.HandlerFunc {
 }
 
 // HandleGet handles GET /products/{id} — returns a single product.
-//
-// {id} is a path parameter. In the URL "/products/prod_1", the {id}
-// is "prod_1". Go 1.22's enhanced ServeMux extracts this automatically
-// via r.PathValue("id").
 func (h *ProductHandler) HandleGet() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// r.PathValue("id") extracts the {id} from the URL pattern.
-		// This was added in Go 1.22 — before that, you had to parse
-		// the URL manually or use a third-party router.
 		id := r.PathValue("id")
 
-		product, err := h.service.GetProduct(id)
+		product, err := h.service.GetProduct(r.Context(), id)
 		if err != nil {
 			handleServiceError(w, err)
 			return
@@ -64,39 +59,20 @@ func (h *ProductHandler) HandleGet() http.HandlerFunc {
 }
 
 // HandleCreate handles POST /products — creates a new product.
-//
-// HTTP METHOD MEANINGS (REST conventions):
-//   GET    = Read (safe, no side effects)
-//   POST   = Create (creates a new resource)
-//   PUT    = Update/Replace (replaces the entire resource)
-//   DELETE = Delete (removes the resource)
-//
-// STATUS CODE CONVENTIONS:
-//   200 OK         = Success (for GET, PUT, DELETE)
-//   201 Created    = Success (specifically for POST — a new resource was created)
-//   204 No Content = Success (for DELETE — nothing to return)
-//   400 Bad Request  = Client sent invalid data
-//   404 Not Found    = Resource doesn't exist
-//   409 Conflict     = Operation conflicts with existing state
-//   500 Internal Server Error = Unexpected server failure
 func (h *ProductHandler) HandleCreate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Step 1: Decode the JSON request body into our DTO.
 		var req model.CreateProductRequest
 		if err := decodeJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, "INVALID_JSON", "Request body must be valid JSON")
 			return
 		}
 
-		// Step 2: Call the service (which validates and stores).
-		product, err := h.service.CreateProduct(req)
+		product, err := h.service.CreateProduct(r.Context(), req)
 		if err != nil {
 			handleServiceError(w, err)
 			return
 		}
 
-		// Step 3: Return 201 Created with the new product (including its ID).
-		// 201 (not 200) because a new resource was created.
 		writeJSON(w, http.StatusCreated, product)
 	}
 }
@@ -112,7 +88,7 @@ func (h *ProductHandler) HandleUpdate() http.HandlerFunc {
 			return
 		}
 
-		product, err := h.service.UpdateProduct(id, req)
+		product, err := h.service.UpdateProduct(r.Context(), id, req)
 		if err != nil {
 			handleServiceError(w, err)
 			return
@@ -127,53 +103,33 @@ func (h *ProductHandler) HandleDelete() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
 
-		if err := h.service.DeleteProduct(id); err != nil {
+		if err := h.service.DeleteProduct(r.Context(), id); err != nil {
 			handleServiceError(w, err)
 			return
 		}
 
-		// 204 No Content — the delete succeeded, but there's nothing to return.
-		// This is the standard response for successful DELETE operations.
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
 // --- Helper functions ---
-// These are private (lowercase) functions used only within this package.
-// They reduce repetition across handlers.
 
-// writeJSON encodes a value as JSON and writes it to the response.
-// Used by every successful response.
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
 }
 
-// writeError writes a standardized error response.
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, ErrorResponse{Error: message, Code: code})
 }
 
-// decodeJSON reads the request body and decodes it into the given value.
-//
-// DisallowUnknownFields() is a security/correctness measure: if a client
-// sends {"name": "Laptop", "proce": 999} (typo in "price"), without this
-// setting, the typo would be silently ignored and price would default to 0.
-// With DisallowUnknownFields, the decode fails and the client gets a clear
-// 400 error — much easier to debug.
 func decodeJSON(r *http.Request, v any) error {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(v)
 }
 
-// handleServiceError maps domain error types to HTTP status codes.
-//
-// THIS IS WHERE THE CUSTOM ERROR TYPES PAY OFF.
-// The service returns domain errors (NotFoundError, ValidationError).
-// The handler translates them to HTTP status codes. The service never
-// knows about HTTP, and the handler never knows about business rules.
 func handleServiceError(w http.ResponseWriter, err error) {
 	switch e := err.(type) {
 	case *model.NotFoundError:
@@ -183,7 +139,6 @@ func handleServiceError(w http.ResponseWriter, err error) {
 	case *model.ConflictError:
 		writeError(w, http.StatusConflict, "CONFLICT", e.Error())
 	default:
-		// Any error we don't recognize is a 500 — something unexpected happened.
 		writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "An unexpected error occurred")
 	}
 }

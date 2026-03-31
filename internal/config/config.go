@@ -9,24 +9,36 @@ import "os"
 // Config holds all configuration for the application.
 // Each field maps to an environment variable.
 type Config struct {
-	Port string // The port the HTTP server listens on (e.g., "8080")
+	Port        string // The port the HTTP server listens on (e.g., "8080")
+	DatabaseURL string // PostgreSQL connection string
 }
 
 // Load reads configuration from environment variables.
-// If an environment variable is not set, it falls back to a default value.
-// This is the simplest config pattern — later phases might use a library
-// like "envconfig" for more complex needs, but this is how it starts.
+//
+// WHAT IS A DATABASE URL?
+// It's a single string that contains everything needed to connect to a database:
+//   postgres://user:password@host:port/dbname?sslmode=disable
+//
+// Breaking it down:
+//   postgres://           → the protocol (like https:// for websites)
+//   sachaweb:sachaweb     → username:password
+//   @localhost:5432       → host:port (localhost because Docker maps to your machine)
+//   /sachaweb             → database name
+//   ?sslmode=disable      → connection options (no SSL for local dev)
+//
+// In production, this would be something like:
+//   postgres://app_user:s3cur3p@ss@db.neon.tech:5432/sachaweb_prod?sslmode=require
+//
+// The DATABASE_URL environment variable is a standard convention used by
+// Heroku, Fly.io, Render, Railway, and most cloud platforms.
 func Load() Config {
 	return Config{
-		Port: getEnv("PORT", "8080"),
+		Port:        getEnv("PORT", "8080"),
+		DatabaseURL: getEnv("DATABASE_URL", "postgres://sachaweb:sachaweb@localhost:5432/sachaweb?sslmode=disable"),
 	}
 }
 
-// getEnv reads an environment variable or returns a default value.
-// This is a tiny helper, but it makes Load() much cleaner to read.
 func getEnv(key, fallback string) string {
-	// os.Getenv returns "" if the variable is not set.
-	// We treat "" as "not set" and use the fallback.
 	if value := os.Getenv(key); value != "" {
 		return value
 	}

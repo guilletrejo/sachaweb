@@ -3,8 +3,8 @@
 //
 // The rest of the application talks to repositories through INTERFACES,
 // not concrete types. This means you can swap the storage implementation
-// without changing any other code — which is exactly what we'll do
-// in Phase 3 when we switch to PostgreSQL.
+// without changing any other code — which is exactly what we're doing
+// NOW in Phase 3 by switching from an in-memory map to PostgreSQL.
 //
 // This is the "D" in SOLID: Dependency Inversion Principle.
 // High-level code (handlers, services) depends on abstractions (interfaces),
@@ -12,6 +12,7 @@
 package repository
 
 import (
+	"context"
 	"sync"
 
 	"github.com/guilletrejo/sachaweb/internal/model"
@@ -19,55 +20,50 @@ import (
 
 // ProductRepository defines the contract for product data access.
 //
-// WHAT IS AN INTERFACE IN THIS CONTEXT?
-// It's a contract that says "any type that has these methods can be used
-// as a ProductRepository." The handler doesn't care if products are stored
-// in memory, PostgreSQL, or a text file — as long as the storage
-// implements these 5 methods.
+// WHAT CHANGED FROM PHASE 2?
+// Every method now takes a context.Context as its first parameter.
 //
-// WHY IS THIS POWERFUL?
-// 1. Swappability: Switch from memory to PostgreSQL without changing handlers.
-// 2. Testability: In tests, use a simple mock that returns hardcoded data.
-// 3. Decoupling: Each layer only knows about the interface, not the implementation.
+// WHAT IS context.Context?
+// Context carries deadlines, cancellation signals, and request-scoped values
+// across API boundaries and between goroutines. In backend development,
+// it's the #1 most important Go pattern to understand. Here's why:
+//
+// Imagine a user sends an HTTP request, but then closes their browser.
+// The HTTP server detects this and CANCELS the request's context.
+// If your database query is still running, context lets PostgreSQL know
+// "stop working, nobody is waiting for this result anymore."
+//
+// Without context:
+//   User closes browser → server keeps running the query → wastes CPU/memory
+//
+// With context:
+//   User closes browser → context is cancelled → query stops → resources freed
+//
+// At MercadoLibre scale (millions of requests), this saves enormous resources.
+//
+// CONVENTION: context.Context is ALWAYS the first parameter, named "ctx".
+// This is a universal Go convention — every Go developer expects it.
 type ProductRepository interface {
-	FindAll() ([]model.Product, error)
-	FindByID(id string) (model.Product, error)
-	Create(product model.Product) error
-	Update(product model.Product) error
-	Delete(id string) error
+	FindAll(ctx context.Context) ([]model.Product, error)
+	FindByID(ctx context.Context, id string) (model.Product, error)
+	Create(ctx context.Context, product model.Product) error
+	Update(ctx context.Context, product model.Product) error
+	Delete(ctx context.Context, id string) error
 }
 
 // MemoryProductRepo stores products in an in-memory map.
-// This is our Phase 1-2 implementation. Phase 3 replaces it with PostgreSQL.
+// This was our Phase 1-2 implementation. It still works (and is useful
+// for tests), but the main app now uses PostgresProductRepo.
 //
-// WHAT IS sync.RWMutex?
-//
-// Go's HTTP server handles each request in a separate goroutine (lightweight
-// thread). If two requests arrive at the same time — say one is reading all
-// products while another is creating a new product — they both access the
-// same map concurrently. In Go, concurrent reads are fine, but a concurrent
-// read + write to a map causes a PANIC (crash).
-//
-// sync.RWMutex (Read-Write Mutex) solves this:
-//   - mu.RLock()  → "I'm reading. Other readers can proceed, but writers must wait."
-//   - mu.Lock()   → "I'm writing. EVERYONE must wait (readers AND writers)."
-//   - mu.RUnlock() / mu.Unlock() → "I'm done."
-//
-// This allows many simultaneous readers (fast) but only one writer at a time (safe).
-// At MercadoLibre, products are read millions of times but written rarely,
-// so RWMutex is the perfect fit — reads don't block each other.
+// Note: the context parameter is accepted but not used here —
+// there's no database connection to cancel. The interface requires it
+// because the PostgreSQL implementation needs it.
 type MemoryProductRepo struct {
-	mu       sync.RWMutex       // protects the products map from concurrent access
-	products map[string]model.Product // key = product ID, value = product
+	mu       sync.RWMutex
+	products map[string]model.Product
 }
 
 // NewMemoryProductRepo creates a new in-memory repository.
-//
-// This is a CONSTRUCTOR function — Go doesn't have constructors like
-// Java/Python, so the convention is a function named New<Type> that
-// returns an initialized instance.
-//
-// It accepts initial products so we can seed it with sample data.
 func NewMemoryProductRepo(initial []model.Product) *MemoryProductRepo {
 	products := make(map[string]model.Product, len(initial))
 	for _, p := range initial {
@@ -79,25 +75,15 @@ func NewMemoryProductRepo(initial []model.Product) *MemoryProductRepo {
 }
 
 // Compile-time check: ensure MemoryProductRepo implements ProductRepository.
-//
-// This line doesn't execute at runtime — it's a compile-time assertion.
-// If MemoryProductRepo is missing any method from ProductRepository,
-// the code won't compile. This catches mistakes immediately, not when
-// a user hits the endpoint.
-//
-// The _ means "discard the value" — we don't need the variable,
-// we just need the compiler to check the type assertion.
 var _ ProductRepository = (*MemoryProductRepo)(nil)
 
 // FindAll returns all products. Thread-safe for concurrent reads.
-func (r *MemoryProductRepo) FindAll() ([]model.Product, error) {
-	r.mu.RLock()         // acquire read lock (multiple readers allowed)
-	defer r.mu.RUnlock() // release read lock when function returns
+// The _ before ctx means "I receive this parameter but don't use it."
+// The in-memory implementation has nothing to cancel.
+func (r *MemoryProductRepo) FindAll(_ context.Context) ([]model.Product, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-	// Build a slice from the map values.
-	// We pre-allocate the slice with make([]T, 0, len) for efficiency —
-	// this tells Go "I'll need space for this many elements" so it
-	// doesn't have to resize the underlying array as we append.
 	result := make([]model.Product, 0, len(r.products))
 	for _, p := range r.products {
 		result = append(result, p)
@@ -106,13 +92,10 @@ func (r *MemoryProductRepo) FindAll() ([]model.Product, error) {
 }
 
 // FindByID returns a single product by its ID.
-// Returns a NotFoundError if the product doesn't exist.
-func (r *MemoryProductRepo) FindByID(id string) (model.Product, error) {
+func (r *MemoryProductRepo) FindByID(_ context.Context, id string) (model.Product, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Go maps return a second value (ok) that tells you if the key exists.
-	// This is called the "comma ok" idiom — you'll see it everywhere in Go.
 	product, ok := r.products[id]
 	if !ok {
 		return model.Product{}, &model.NotFoundError{Resource: "product", ID: id}
@@ -120,10 +103,10 @@ func (r *MemoryProductRepo) FindByID(id string) (model.Product, error) {
 	return product, nil
 }
 
-// Create adds a new product. Returns ConflictError if the ID already exists.
-func (r *MemoryProductRepo) Create(product model.Product) error {
-	r.mu.Lock()         // acquire WRITE lock (exclusive access)
-	defer r.mu.Unlock() // release write lock when function returns
+// Create adds a new product.
+func (r *MemoryProductRepo) Create(_ context.Context, product model.Product) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	if _, exists := r.products[product.ID]; exists {
 		return &model.ConflictError{Resource: "product", ID: product.ID}
@@ -132,8 +115,8 @@ func (r *MemoryProductRepo) Create(product model.Product) error {
 	return nil
 }
 
-// Update replaces an existing product. Returns NotFoundError if it doesn't exist.
-func (r *MemoryProductRepo) Update(product model.Product) error {
+// Update replaces an existing product.
+func (r *MemoryProductRepo) Update(_ context.Context, product model.Product) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -144,15 +127,14 @@ func (r *MemoryProductRepo) Update(product model.Product) error {
 	return nil
 }
 
-// Delete removes a product by ID. Returns NotFoundError if it doesn't exist.
-func (r *MemoryProductRepo) Delete(id string) error {
+// Delete removes a product by ID.
+func (r *MemoryProductRepo) Delete(_ context.Context, id string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if _, exists := r.products[id]; !exists {
 		return &model.NotFoundError{Resource: "product", ID: id}
 	}
-	// delete() is a built-in Go function that removes a key from a map.
 	delete(r.products, id)
 	return nil
 }
